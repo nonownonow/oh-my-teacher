@@ -96,7 +96,20 @@ if uploaded_file is not None:
         )
 
         # Chroma DB
-        db = Chroma.from_documents(texts, embeddings_model)
+        # Use a temporary directory to avoid tenant/persistence issues
+        chroma_persist_dir = os.path.join(
+            tempfile.gettempdir(), "chroma_db_" + file.name)
+        # Clear existing checking if needed, but for now just use it.
+        # Actually safer to make it random or cleared.
+        # Let's simple use a new temp dir for this session's cache of this file.
+        # Since embed_file is cached, we want a stable path if we want to reuse?
+        # But st.cache_resource caches the RETURN value (retriever), so DB object is kept in memory.
+        # The persistence on disk matters for initialization stability.
+        # Let's use a unique temp dir.
+
+        persist_dir = tempfile.mkdtemp()
+        db = Chroma.from_documents(
+            texts, embeddings_model, persist_directory=persist_dir)
 
         # Retriever
         return db.as_retriever(search_kwargs={"k": 5})
