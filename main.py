@@ -12,6 +12,7 @@ import pdfplumber
 import os
 import streamlit as st
 import tempfile
+import chromadb
 from langchain.callbacks.base import BaseCallbackHandler
 from streamlit_extras.buy_me_a_coffee import button
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -61,7 +62,7 @@ class StreamHandler(BaseCallbackHandler):
 
 if uploaded_file is not None:
     @st.cache_resource(show_spinner="문서 분석 및 임베딩 중...")
-    def embed_file(file, _openai_key):
+    def embed_file_v5(file, _openai_key):
         file_content = file.read()
 
         # Use a temporary directory for file storage to avoid clutter
@@ -91,18 +92,29 @@ if uploaded_file is not None:
             st.stop()
 
         embeddings_model = OpenAIEmbeddings(
-            model="text-embedding-3-large", openai_api_key=_openai_key)
+            model="text-embedding-3-small", openai_api_key=_openai_key)
 
-        # Chroma DB - In-memory/Temp for this session
-        # Using a fixed persist_directory might cause locking issues in Streamlit Cloud if not handled carefully,
-        # but for simplicity here we assume ephemeral usage or use Client.
-        # Ideally for simple apps without persistence requirements, just in-memory or temp dir is fine.
-        db = Chroma.from_documents(texts, embeddings_model)
+        # Chroma DB - Persistent Client
+        # We use a persistent directory rooted in the current execution folder.
+        # This creates a real SQLite file, which is accessible across threads/processes,
+        # solving the "no such table" error caused by Streamlit caching in-memory DB connections.
+        # We use a subfolder based on the filename to isolate data (simple approach).
+        safe_name = "".join([c for c in file.name if c.isalnum()])
+        persist_dir = os.path.join(os.getcwd(), ".chroma_db", safe_name)
+
+        client = chromadb.PersistentClient(path=persist_dir)
+
+        db = Chroma.from_documents(
+            texts,
+            embeddings_model,
+            client=client,
+            collection_name="openai_collection"
+        )
 
         return db.as_retriever(search_kwargs={"k": 5})
 
     try:
-        retriever = embed_file(uploaded_file, openai_key)
+        retriever = embed_file_v5(uploaded_file, openai_key)
     except Exception as e:
         st.error(f"Error: {e}")
         st.stop()
