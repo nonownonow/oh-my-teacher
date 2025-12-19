@@ -7,21 +7,29 @@ except ImportError:
     pass
 
 from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 import pdfplumber
 import os
 import streamlit as st
 import tempfile
 import chromadb
+from dotenv import load_dotenv
 from langchain.callbacks.base import BaseCallbackHandler
 from streamlit_extras.buy_me_a_coffee import button
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_chroma import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+# .env 파일에서 환경변수 로드
+load_dotenv()
+
+# 환경변수에서 Ollama API 키 읽기
+OLLAMA_API_KEY = os.getenv("OLLAMA_AI_API", "")
+
 # 제목 및 스타일
 st.set_page_config(page_title="나의 과외 선생님 👨‍🏫", page_icon="👨‍🏫")
-st.title("나의 과외 선생님 (Simple RAG)")
+st.title("나의 과외 선생님")
 st.markdown("""
 <style>
     .reportview-container {
@@ -36,7 +44,19 @@ st.write("---")
 # --------------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ 설정")
-    openai_key = st.text_input('OPEN_AI_API_KEY', type="password")
+    # Model Selection
+    model_provider = st.radio(
+        "모델 선택",
+        ["GPT-4o (상용/고품질)", "Ollama (Cloud)"],
+        index=0
+    )
+
+    openai_key = ""
+    ollama_url = "https://ollama.com"
+    ollama_key = OLLAMA_API_KEY
+
+    if model_provider == "GPT-4o (상용/고품질)":
+        openai_key = st.text_input('OPEN_AI_API_KEY', type="password")
 
     st.divider()
     button(username="{계정 ID}", floating=False, width=221)
@@ -61,7 +81,7 @@ class StreamHandler(BaseCallbackHandler):
 
 
 @st.cache_resource(show_spinner="문서 분석 및 임베딩 중...")
-def embed_file_v5(file, _openai_key):
+def embed_file_v6(file, provider, _api_key, _ollama_url, _ollama_key):
     file_content = file.read()
 
     # Use a temporary directory for file storage to avoid clutter
@@ -85,21 +105,32 @@ def embed_file_v5(file, _openai_key):
         chunk_size=1000, chunk_overlap=100)
     texts = text_splitter.split_documents(documents)
 
-    # Embedding
-    if not _openai_key:
-        st.error("OpenAI API Key Required")
-        st.stop()
+    # Embedding Logic
+    if provider == "GPT-4o (상용/고품질)":
+        if not _api_key:
+            st.error("OpenAI API Key Required")
+            st.stop()
+        embeddings_model = OpenAIEmbeddings(
+            model="text-embedding-3-small", openai_api_key=_api_key)
+        collection_name = "openai_collection"
+    else:
+        # Ollama Embeddings
+        headers = {}
+        if _ollama_key:
+            headers["Authorization"] = f"Bearer {_ollama_key}"
 
-    embeddings_model = OpenAIEmbeddings(
-        model="text-embedding-3-small", openai_api_key=_openai_key)
+        embeddings_model = OllamaEmbeddings(
+            base_url=_ollama_url,
+            model="gemma3:27b",
+            client_kwargs={"headers": headers} if headers else {}
+        )
+        collection_name = "ollama_collection"
 
     # Chroma DB - Persistent Client
-    # We use a persistent directory rooted in the current execution folder.
-    # This creates a real SQLite file, which is accessible across threads/processes,
-    # solving the "no such table" error caused by Streamlit caching in-memory DB connections.
-    # We use a subfolder based on the filename to isolate data (simple approach).
     safe_name = "".join([c for c in file.name if c.isalnum()])
-    persist_dir = os.path.join(os.getcwd(), ".chroma_db", safe_name)
+    provider_prefix = "gpt" if provider == "GPT-4o (상용/고품질)" else "ollama"
+    persist_dir = os.path.join(
+        os.getcwd(), ".chroma_db", provider_prefix, safe_name)
 
     client = chromadb.PersistentClient(path=persist_dir)
 
@@ -107,15 +138,16 @@ def embed_file_v5(file, _openai_key):
         texts,
         embeddings_model,
         client=client,
-        collection_name="openai_collection"
+        collection_name=collection_name
     )
 
-    return db.as_retriever(search_kwargs={"k": 5})
+    return db.as_retriever(search_kwargs={"k": 10})
 
 
 if uploaded_file is not None:
     try:
-        retriever = embed_file_v5(uploaded_file, openai_key)
+        retriever = embed_file_v6(
+            uploaded_file, model_provider, openai_key, ollama_url, ollama_key)
     except Exception as e:
         st.error(f"Error: {e}")
         st.stop()
@@ -142,23 +174,42 @@ if uploaded_file is not None:
             context_text = "\n\n".join(doc.page_content for doc in docs)
 
             # Generation
-            llm = ChatOpenAI(
-                model="gpt-4o-mini",
-                temperature=0,
-                openai_api_key=openai_key,
-                streaming=True,
-                callbacks=[StreamHandler(status_container)]
-            )
+            if model_provider == "GPT-4o (상용/고품질)":
+                llm = ChatOpenAI(
+                    model="gpt-4o",  # Upgraded to 4o for "Best Quality"
+                    temperature=0,
+                    openai_api_key=openai_key,
+                    streaming=True,
+                    callbacks=[StreamHandler(status_container)]
+                )
+            else:
+                headers = {}
+                if ollama_key:
+                    headers["Authorization"] = f"Bearer {ollama_key}"
 
-            # Simple RAG Prompt
+                llm = ChatOllama(
+                    base_url=ollama_url,
+                    model="gemma3:27b",  # Using llama3 for "Best Free"
+                    temperature=0,
+                    streaming=True,
+                    callbacks=[StreamHandler(status_container)],
+                    client_kwargs={"headers": headers} if headers else {}
+                )
+
+            # Simple RAG Prompt (한국어)
             system_prompt = (
-                "You are a helpful tutor. Answer the question based ONLY on the following context.\n"
-                "If the answer is not in the context, say you don't know.\n\n"
-                f"Context:\n{context_text}"
+                "당신은 문서 기반 질문 답변 전문가입니다. "
+                "아래 제공된 문맥(Context)을 기반으로 사용자의 질문에 상세하게 답변하세요.\n"
+                "문맥에 관련 정보가 있다면 반드시 그 내용을 활용하여 답변하세요.\n"
+                "문맥에 정보가 전혀 없는 경우에만 모른다고 답변하세요.\n\n"
+                f"[문맥]\n{context_text}\n\n"
+                "[지시사항]\n"
+                "- 문맥에서 관련 내용을 찾아 구체적으로 답변하세요.\n"
+                "- 한국어로 답변하세요."
             )
 
             response = llm.invoke([
-                HumanMessage(content=system_prompt),
+                SystemMessage(content=system_prompt),
                 HumanMessage(content=prompt_message)
             ])
 
