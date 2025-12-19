@@ -17,7 +17,8 @@ from dotenv import load_dotenv
 from langchain.callbacks.base import BaseCallbackHandler
 from streamlit_extras.buy_me_a_coffee import button
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_ollama import ChatOllama
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -47,7 +48,7 @@ with st.sidebar:
     # Model Selection
     model_provider = st.radio(
         "모델 선택",
-        ["GPT-4o (상용/고품질)", "Ollama (Cloud)"],
+        ["GPT-4o (상용/고품질)", "Ollama (설치형/보안)"],
         index=0
     )
 
@@ -114,17 +115,11 @@ def embed_file_v6(file, provider, _api_key, _ollama_url, _ollama_key):
             model="text-embedding-3-small", openai_api_key=_api_key)
         collection_name = "openai_collection"
     else:
-        # Ollama Embeddings
-        headers = {}
-        if _ollama_key:
-            headers["Authorization"] = f"Bearer {_ollama_key}"
-
-        embeddings_model = OllamaEmbeddings(
-            base_url=_ollama_url,
-            model="gemma3:27b",
-            client_kwargs={"headers": headers} if headers else {}
+        # HuggingFace Embeddings (무료, 로컬 실행)
+        embeddings_model = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
-        collection_name = "ollama_collection"
+        collection_name = "hf_collection"
 
     # Chroma DB - Persistent Client
     safe_name = "".join([c for c in file.name if c.isalnum()])
@@ -141,7 +136,7 @@ def embed_file_v6(file, provider, _api_key, _ollama_url, _ollama_key):
         collection_name=collection_name
     )
 
-    return db.as_retriever(search_kwargs={"k": 10})
+    return db.as_retriever(search_kwargs={"k": 3})
 
 
 if uploaded_file is not None:
