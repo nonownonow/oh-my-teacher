@@ -327,7 +327,6 @@ def map_reduce_with_ollama(
     semantic_expansion: dict,
     ollama_url: str,
     ollama_key: str,
-    status_container,
     gpt_reasoning_answer: str = "",
     batch_size: int = 2
 ) -> str:
@@ -354,7 +353,7 @@ def map_reduce_with_ollama(
 
     # Map 단계: 각 배치에서 관련 정보 추출 (출력 없음)
     extracted_infos = []
-    for idx, batch in enumerate(batches):
+    for batch in batches:
 
         batch_content = "\n\n".join(doc.page_content for doc in batch)
         # Ollama Cloud 토큰 한도 대응
@@ -492,7 +491,6 @@ def embed_file(file, provider, _api_key):
 if uploaded_file is not None:
     try:
         retriever, all_chunks_text, chunk_count = embed_file(uploaded_file, model_provider, openai_key)
-        st.sidebar.info(f"📄 문서 처리 완료: {chunk_count}개 청크")
     except Exception as e:
         st.error(f"Error: {e}")
         st.stop()
@@ -579,7 +577,6 @@ if uploaded_file is not None:
                     semantic_expansion=semantic_expansion,
                     ollama_url=ollama_url,
                     ollama_key=ollama_key,
-                    status_container=st.empty(),  # 빈 컨테이너 (출력 안 함)
                     gpt_reasoning_answer=gpt_reasoning_answer,
                     batch_size=3
                 )
@@ -632,11 +629,6 @@ if uploaded_file is not None:
 [지시사항]
 - 문맥 기반으로 답변하세요.
 - 한국어로 답변하세요."""
-
-                # 디버그: 전체 프롬프트 길이 표시
-                total_chars = len(system_prompt) + len(prompt_message)
-                st.sidebar.write(f"📊 문맥: {len(limited_context):,}자")
-                st.sidebar.write(f"📊 전체 프롬프트: {total_chars:,}자")
 
                 response = llm.invoke([
                     SystemMessage(content=system_prompt),
