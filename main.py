@@ -86,10 +86,11 @@ class StreamHandler(BaseCallbackHandler):
 def get_gpt_reasoning_answer(question: str, api_key: str) -> str:
     """
     GPT가 자신의 학습 데이터만으로 질문에 답변 (PDF 내용 없이)
-    추론 모델을 사용하여 고품질 답변 생성
+    고품질 추론 답변 생성
     """
     llm = ChatOpenAI(
-        model="o1-mini",  # 추론 모델 사용
+        model="gpt-4o",  # 고품질 추론
+        temperature=0,
         openai_api_key=api_key,
     )
 
@@ -113,11 +114,11 @@ def get_gpt_reasoning_answer(question: str, api_key: str) -> str:
 
 def refine_answer_with_gpt(draft_answer: str, question: str, api_key: str) -> str:
     """
-    Ollama가 생성한 초안 답변을 GPT가 최종 교정
+    Ollama가 생성한 초안 답변을 GPT가 교정
     더 정확하고 정교하게 다듬음
     """
     llm = ChatOpenAI(
-        model="gpt-4o",  # 고품질 교정을 위해 gpt-4o 사용
+        model="gpt-4o",
         temperature=0,
         openai_api_key=api_key,
     )
@@ -140,9 +141,64 @@ def refine_answer_with_gpt(draft_answer: str, question: str, api_key: str) -> st
 6. 핵심 내용은 유지하면서 품질을 높이세요.
 7. 한국어로 자연스럽게 작성하세요.
 
-[교정된 최종 답변]"""
+[교정된 답변]"""
 
     response = llm.invoke([HumanMessage(content=refine_prompt)])
+    return response.content
+
+
+def verify_with_ollama_pdf(
+    gpt_answer: str,
+    question: str,
+    pdf_context: str,
+    ollama_url: str,
+    ollama_key: str,
+    status_container
+) -> str:
+    """
+    GPT 답변을 PDF 원본 데이터 기반으로 Ollama가 최종 검증
+    PDF에 없는 거짓 정보는 삭제하고, PDF 기반 진실만 남김
+    """
+    headers = {}
+    if ollama_key:
+        headers["Authorization"] = f"Bearer {ollama_key}"
+
+    llm = ChatOllama(
+        base_url=ollama_url,
+        model="gemma3:27b",
+        temperature=0,
+        streaming=True,
+        callbacks=[StreamHandler(status_container)],
+        client_kwargs={"headers": headers} if headers else {}
+    )
+
+    verify_prompt = f"""당신은 엄격한 팩트체커입니다.
+GPT가 작성한 답변을 PDF 원본 문서와 대조하여 철저히 검증하세요.
+
+[PDF 원본 문서 - 유일한 진실의 기준]
+{pdf_context}
+
+[GPT가 작성한 답변 - 검증 대상]
+{gpt_answer}
+
+[검증 규칙 - 반드시 준수]
+1. PDF 문서가 유일한 진실입니다. PDF에 없으면 거짓입니다.
+2. 등장인물: PDF에 명시된 이름만 사용하세요. PDF에 없는 인물은 삭제하세요.
+3. 관계: PDF에 명시된 관계만 사용하세요. 추측하지 마세요.
+4. 사건: PDF에 있는 사건만 포함하세요.
+5. GPT가 언급했지만 PDF에 없는 모든 정보는 과감히 삭제하세요.
+6. 확신이 없으면 포함하지 마세요.
+
+[콘텐츠 필터링]
+- 교육적으로 부적절한 표현은 순화하세요.
+
+[최종 답변]"""
+
+    response = llm.invoke([
+        SystemMessage(content=verify_prompt),
+        HumanMessage(content=question)
+    ])
+
     return response.content
 
 
@@ -338,32 +394,33 @@ def map_reduce_with_ollama(
 - 관련 주제: {', '.join(semantic_expansion.get('related_topics', []))}
 - 분석 관점: {', '.join(semantic_expansion.get('sub_questions', [])[:3])}"""
 
-    # GPT 추론 답변 섹션 (가중치 높음)
+    # GPT 추론 답변 섹션 (참고용, 낮은 가중치)
     gpt_section = ""
     if gpt_reasoning_answer:
         gpt_section = f"""
-[★★★ GPT 전문가 답변 - 가중치 높음 ★★★]
+[GPT 참고 답변 - 구조/표현만 참고]
 {gpt_reasoning_answer}
 
 """
 
     reduce_prompt = f"""당신은 친절한 과외 선생님입니다.
-아래 정보들을 종합하여 학생의 질문에 최고 품질의 답변을 작성하세요.
-{gpt_section}
-[문서에서 추출된 정보들]
+아래 정보들을 종합하여 학생의 질문에 답변을 작성하세요.
+
+[★★★ PDF 문서 정보 - 가중치 최우선 ★★★]
 {combined_info}
 
 {expansion_info}
-
+{gpt_section}
 [가중치 적용 규칙 - 매우 중요]
-1. GPT 전문가 답변에 가장 높은 가중치(70%)를 부여하세요.
-2. 문서 정보는 GPT 답변을 보완하는 용도로 사용하세요(30%).
-3. 문서 정보와 GPT 답변이 충돌할 경우, GPT 답변을 우선하세요.
-4. 단, 문서에만 있는 고유한 정보(이름, 날짜, 구체적 사건)는 반드시 포함하세요.
+1. PDF 문서 정보에 가장 높은 가중치(70%)를 부여하세요.
+2. GPT 답변은 구조와 표현 참고용으로만 사용하세요(30%).
+3. PDF 문서와 GPT 답변이 충돌할 경우, PDF 문서를 우선하세요.
+4. 등장인물 이름, 관계, 사건은 반드시 PDF 문서 그대로 사용하세요.
+5. GPT가 언급했지만 PDF에 없는 정보는 포함하지 마세요.
 
 [지시사항]
-- GPT 답변의 논리와 구조를 기반으로 답변을 구성하세요.
-- 문서의 구체적인 내용으로 GPT 답변을 보강하세요.
+- PDF 문서의 내용을 기반으로 답변을 구성하세요.
+- GPT 답변의 좋은 구조와 표현만 참고하세요.
 - 한국어로 친절하고 상세하게 답변하세요.
 
 [콘텐츠 필터링 - 필수]
@@ -494,50 +551,58 @@ if uploaded_file is not None:
                 ])
 
             elif model_provider == "하이브리드 (GPT벡터추론+Ollama답변)":
-                # 1단계: GPT 추론 모델로 직접 답변 받기 (PDF 없이, 학습 데이터 기반)
-                status_container.markdown("🧠 GPT 추론 모델이 답변 생성 중... (PDF 내용 보호)")
+                # 진행 상태만 간단히 표시
+                progress_placeholder = status_container.empty()
+                progress_placeholder.markdown("⏳ 답변 생성 중...")
 
+                # 1단계: GPT 추론 답변 (PDF 없이)
                 gpt_reasoning_answer = get_gpt_reasoning_answer(
                     prompt_message, openai_key
                 )
 
-                # 2단계: GPT 벡터 추론 - 질문의 의미적 확장
-                status_container.markdown("🔮 GPT 벡터 추론 중... (의미적 확장)")
-
+                # 2단계: GPT 벡터 추론
                 semantic_expansion = get_semantic_expansion_from_gpt(
                     prompt_message, openai_key
                 )
 
-                # 3단계: 확장된 벡터 검색 - GPT의 추론 결과를 활용
-                status_container.markdown("🔍 GPT 추론 기반 향상된 벡터 검색 중...")
-
+                # 3단계: 향상된 벡터 검색
                 enhanced_docs = enhanced_vector_search(
                     retriever, prompt_message, semantic_expansion, k=10
                 )
 
-                # 4단계: Map-Reduce로 분할 처리 (GPT 답변 가중치 적용)
-                status_container.markdown("⚖️ GPT 답변(70%) + 문서 정보(30%) 통합 중...")
-
+                # 4단계: Map-Reduce (중간 출력 숨김)
+                hidden_container = st.empty()
                 draft_answer = map_reduce_with_ollama(
                     docs=enhanced_docs,
                     question=prompt_message,
                     semantic_expansion=semantic_expansion,
                     ollama_url=ollama_url,
                     ollama_key=ollama_key,
-                    status_container=status_container,
+                    status_container=hidden_container,
                     gpt_reasoning_answer=gpt_reasoning_answer,
                     batch_size=2
                 )
+                hidden_container.empty()  # 중간 출력 삭제
 
-                # 5단계: GPT 최종 교정 - 정확성과 품질 향상
-                status_container.markdown("✨ GPT가 최종 답변 교정 중...")
-
-                final_answer = refine_answer_with_gpt(
+                # 5단계: GPT 교정
+                gpt_refined_answer = refine_answer_with_gpt(
                     draft_answer, prompt_message, openai_key
                 )
 
-                # 최종 답변 표시
-                status_container.markdown(final_answer)
+                # 6단계: Ollama 최종 검증 (PDF 기반 진위 판별)
+                progress_placeholder.empty()  # 진행 상태 삭제
+
+                # enhanced_docs를 사용하여 더 많은 PDF 컨텍스트로 검증
+                enhanced_context = "\n\n".join(doc.page_content for doc in enhanced_docs)
+
+                final_answer = verify_with_ollama_pdf(
+                    gpt_answer=gpt_refined_answer,
+                    question=prompt_message,
+                    pdf_context=enhanced_context,
+                    ollama_url=ollama_url,
+                    ollama_key=ollama_key,
+                    status_container=status_container
+                )
 
                 # 세션에 저장하고 종료
                 st.session_state.messages.append(
