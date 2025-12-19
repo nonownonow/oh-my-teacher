@@ -53,7 +53,7 @@ with st.sidebar:
         help="하이브리드: GPT가 질문만 받아 벡터 추론(의미 확장) 수행 → Ollama가 향상된 벡터 검색으로 고품질 답변 생성 (PDF 내용 보호)"
     )
 
-    ollama_url = "https://ollama.com"
+    ollama_url = "https://ollama.com"  # Ollama Cloud API
     ollama_key = OLLAMA_API_KEY
 
     # GPT/하이브리드 모드일 때 OpenAI 키 외부 입력 (항상)
@@ -192,14 +192,18 @@ def verify_with_ollama_pdf(
         client_kwargs={"headers": headers} if headers else {}
     )
 
+    # Ollama 토큰 한도 대응: 문맥 크기 제한
+    limited_pdf_context = pdf_context[:30000] if len(pdf_context) > 30000 else pdf_context
+    limited_gpt_answer = gpt_answer[:10000] if len(gpt_answer) > 10000 else gpt_answer
+
     verify_prompt = f"""당신은 엄격한 팩트체커입니다.
 GPT가 작성한 답변을 PDF 원본 문서와 대조하여 철저히 검증하세요.
 
 [PDF 원본 문서 - 유일한 진실의 기준]
-{pdf_context}
+{limited_pdf_context}
 
 [GPT가 작성한 답변 - 검증 대상]
-{gpt_answer}
+{limited_gpt_answer}
 
 [검증 규칙 - 반드시 준수]
 1. PDF 문서가 유일한 진실입니다. PDF에 없으면 거짓입니다.
@@ -646,18 +650,23 @@ if uploaded_file is not None:
                     client_kwargs={"headers": headers} if headers else {}
                 )
 
-                system_prompt = (
-                    "당신은 문서 기반 질문 답변 전문가입니다. "
-                    "아래 제공된 문맥을 기반으로 사용자의 질문에 상세하게 답변하세요.\n\n"
-                    f"[문맥]\n{context_text}\n\n"
-                    "[지시사항]\n"
-                    "- 문맥에서 관련 내용을 찾아 구체적으로 답변하세요.\n"
-                    "- 한국어로 답변하세요.\n\n"
-                    "[콘텐츠 필터링 - 필수]\n"
-                    "- 교육적으로 부적절한 표현(난봉, 바람둥이, 색골 등)은 순화된 표현으로 대체하세요.\n"
-                    "- 선정적이거나 폭력적인 묘사는 피하고 교육적으로 적합한 표현을 사용하세요.\n"
-                    "- 학생에게 적합한 품위 있는 언어를 사용하세요."
-                )
+                # Ollama Cloud 토큰 한도 대응: 매우 작은 문맥 (테스트용)
+                MAX_CONTEXT_CHARS = 2000  # 아주 작게 설정
+                limited_context = context_text[:MAX_CONTEXT_CHARS] if len(context_text) > MAX_CONTEXT_CHARS else context_text
+
+                system_prompt = f"""문서 기반 질문 답변 전문가입니다.
+
+[문맥]
+{limited_context}
+
+[지시사항]
+- 문맥 기반으로 답변하세요.
+- 한국어로 답변하세요."""
+
+                # 디버그: 전체 프롬프트 길이 표시
+                total_chars = len(system_prompt) + len(prompt_message)
+                st.sidebar.write(f"📊 문맥: {len(limited_context):,}자")
+                st.sidebar.write(f"📊 전체 프롬프트: {total_chars:,}자")
 
                 response = llm.invoke([
                     SystemMessage(content=system_prompt),
