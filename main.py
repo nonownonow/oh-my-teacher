@@ -86,27 +86,47 @@ class StreamHandler(BaseCallbackHandler):
 def get_gpt_reasoning_answer(question: str, api_key: str) -> str:
     """
     GPT가 자신의 학습 데이터만으로 질문에 답변 (PDF 내용 없이)
-    고품질 추론 답변 생성
+    고품질 추론 답변 생성 - 상세하고 포괄적인 답변
     """
     llm = ChatOpenAI(
         model="gpt-4o",  # 고품질 추론
-        temperature=0,
+        temperature=0.2,  # 약간의 창의성으로 더 풍부한 답변
+        max_tokens=2000,  # 충분한 답변 길이 확보
         openai_api_key=api_key,
     )
 
-    reasoning_prompt = f"""당신은 지식이 풍부한 전문가입니다.
-아래 질문에 대해 당신이 알고 있는 지식을 바탕으로 상세하게 답변해주세요.
+    reasoning_prompt = f"""당신은 해당 분야의 최고 전문가이자 열정적인 선생님입니다.
+학생이 아래 질문을 했습니다. 당신의 방대한 지식을 총동원하여
+최대한 상세하고 포괄적으로 답변해주세요.
 
-[질문]
+[학생의 질문]
 {question}
 
-[지시사항]
-- 질문의 핵심을 파악하고 체계적으로 답변하세요.
-- 관련된 배경 지식, 맥락, 중요한 포인트를 포함하세요.
-- 정확하고 신뢰할 수 있는 정보만 제공하세요.
-- 한국어로 답변하세요.
+[답변 작성 규칙 - 반드시 준수]
 
-[답변]"""
+1. **분량 요구사항**: 최소 500자 이상, 가능하면 1000자 이상으로 상세하게 작성하세요.
+
+2. **구조적 답변**: 다음 구조로 답변하세요:
+   - 📌 핵심 답변 (질문에 대한 직접적 답변)
+   - 📚 배경 설명 (맥락, 역사적/문화적 배경)
+   - 👥 관련 인물/요소 (등장인물, 핵심 개념 상세 설명)
+   - 🔍 심층 분석 (주제의 의미, 상징, 교훈)
+   - 💡 추가 관점 (다른 해석, 관련 지식)
+
+3. **상세 설명 원칙**:
+   - 단순 나열이 아닌 각 항목에 대한 충분한 설명 포함
+   - 구체적인 예시와 근거 제시
+   - 전문 용어는 쉽게 풀어서 설명
+   - 인과관계와 논리적 흐름 명확히
+
+4. **교육적 품질**:
+   - 학생이 깊이 이해할 수 있도록 친절하게 설명
+   - 암기가 아닌 이해 중심의 설명
+   - 관련 배경 지식도 함께 제공
+
+5. **한국어로 자연스럽고 풍부하게 작성하세요.**
+
+[상세한 답변]"""
 
     response = llm.invoke([HumanMessage(content=reasoning_prompt)])
     return response.content
@@ -487,12 +507,18 @@ def embed_file(file, provider, _api_key):
         collection_name=collection_name
     )
 
-    return db.as_retriever(search_kwargs={"k": 5})
+    retriever = db.as_retriever(search_kwargs={"k": 10})
+
+    # 모든 청크 텍스트 반환 (GPT 전체 문맥용)
+    all_chunks_text = "\n\n---\n\n".join([doc.page_content for doc in texts])
+
+    return retriever, all_chunks_text, len(texts)
 
 
 if uploaded_file is not None:
     try:
-        retriever = embed_file(uploaded_file, model_provider, openai_key)
+        retriever, all_chunks_text, chunk_count = embed_file(uploaded_file, model_provider, openai_key)
+        st.sidebar.info(f"📄 문서 처리 완료: {chunk_count}개 청크")
     except Exception as e:
         st.error(f"Error: {e}")
         st.stop()
@@ -520,26 +546,32 @@ if uploaded_file is not None:
 
             # Generation
             if model_provider == "GPT-4o (상용/고품질)":
+                # GPT-4o는 전체 PDF 문맥을 사용 (128K 컨텍스트 활용)
                 llm = ChatOpenAI(
                     model="gpt-4o",
                     temperature=0,
+                    max_tokens=4000,  # 충분한 응답 길이
                     openai_api_key=openai_key,
                     streaming=True,
                     callbacks=[StreamHandler(status_container)]
                 )
 
-                system_prompt = (
-                    "당신은 문서 기반 질문 답변 전문가입니다. "
-                    "아래 제공된 문맥을 기반으로 사용자의 질문에 상세하게 답변하세요.\n\n"
-                    f"[문맥]\n{context_text}\n\n"
-                    "[지시사항]\n"
-                    "- 문맥에서 관련 내용을 찾아 구체적으로 답변하세요.\n"
-                    "- 한국어로 답변하세요.\n\n"
-                    "[콘텐츠 필터링 - 필수]\n"
-                    "- 교육적으로 부적절한 표현(난봉, 바람둥이, 색골 등)은 순화된 표현으로 대체하세요.\n"
-                    "- 선정적이거나 폭력적인 묘사는 피하고 교육적으로 적합한 표현을 사용하세요.\n"
-                    "- 학생에게 적합한 품위 있는 언어를 사용하세요."
-                )
+                system_prompt = f"""당신은 문서 기반 질문 답변 전문가입니다.
+아래 제공된 **전체 문서 내용**을 기반으로 사용자의 질문에 상세하고 포괄적으로 답변하세요.
+
+[전체 문서 내용]
+{all_chunks_text}
+
+[답변 지시사항]
+1. **완전성**: 문서 전체를 검토하여 관련된 모든 정보를 포함하세요.
+2. **구체성**: 등장인물, 사건, 관계 등을 문서에 있는 그대로 정확히 답변하세요.
+3. **구조화**: 여러 항목이 있는 경우 목록으로 정리하세요.
+4. **상세 설명**: 각 항목에 대해 충분한 설명을 제공하세요.
+5. **한국어로 친절하게 답변하세요.**
+
+[콘텐츠 필터링 - 필수]
+- 교육적으로 부적절한 표현은 순화된 표현으로 대체하세요.
+- 학생에게 적합한 품위 있는 언어를 사용하세요."""
 
                 response = llm.invoke([
                     SystemMessage(content=system_prompt),
@@ -562,7 +594,7 @@ if uploaded_file is not None:
                 # 2단계: 벡터 검색
                 progress.markdown("🔍 **2/4** 벡터 검색 중...")
                 enhanced_docs = enhanced_vector_search(
-                    retriever, prompt_message, semantic_expansion, k=10
+                    retriever, prompt_message, semantic_expansion, k=15  # 더 많은 문서 검색
                 )
 
                 # 3단계: Map-Reduce (출력 없음)
@@ -584,7 +616,7 @@ if uploaded_file is not None:
                 time.sleep(0.5)  # 진행 상태 표시를 위한 짧은 대기
                 progress.empty()  # 진행 상태 제거
 
-                verify_context = "\n\n".join(doc.page_content for doc in enhanced_docs[:5])
+                verify_context = "\n\n".join(doc.page_content for doc in enhanced_docs[:10])  # 더 넓은 검증 문맥
 
                 final_answer = verify_with_ollama_pdf(
                     gpt_answer=draft_answer,
