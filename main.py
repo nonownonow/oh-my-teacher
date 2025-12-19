@@ -184,8 +184,114 @@ def enhanced_vector_search(retriever, question: str, semantic_expansion: dict, k
         except Exception:
             continue
 
-    # 결과 개수 제한 (토큰 제한 고려)
+    # 결과 개수 제한
     return all_docs[:k]
+
+
+def map_reduce_with_ollama(
+    docs: list,
+    question: str,
+    semantic_expansion: dict,
+    ollama_url: str,
+    ollama_key: str,
+    status_container,
+    batch_size: int = 2
+) -> str:
+    """
+    Map-Reduce 패턴으로 문서를 분할 처리 후 합침
+    1. Map: 각 문서 배치에서 관련 정보 추출
+    2. Reduce: 추출된 정보들을 합쳐서 최종 답변 생성
+    """
+    headers = {}
+    if ollama_key:
+        headers["Authorization"] = f"Bearer {ollama_key}"
+
+    # Map 단계용 LLM (스트리밍 없이)
+    map_llm = ChatOllama(
+        base_url=ollama_url,
+        model="gemma3:27b",
+        temperature=0,
+        streaming=False,
+        client_kwargs={"headers": headers} if headers else {}
+    )
+
+    # 문서를 배치로 분할
+    batches = [docs[i:i + batch_size] for i in range(0, len(docs), batch_size)]
+
+    # Map 단계: 각 배치에서 관련 정보 추출
+    extracted_infos = []
+    for idx, batch in enumerate(batches):
+        status_container.markdown(f"📄 문서 분석 중... ({idx + 1}/{len(batches)})")
+
+        batch_content = "\n\n".join(doc.page_content for doc in batch)
+
+        map_prompt = f"""다음 문서에서 질문에 답변하기 위해 필요한 핵심 정보만 추출하세요.
+
+[문서]
+{batch_content}
+
+[질문]
+{question}
+
+[핵심 개념 참고]
+{', '.join(semantic_expansion.get('core_concepts', []))}
+
+[지시사항]
+- 질문과 관련된 정보만 간결하게 추출하세요.
+- 불필요한 정보는 제외하세요.
+- 관련 정보가 없으면 "관련 정보 없음"이라고 답하세요.
+
+[추출된 정보]"""
+
+        try:
+            response = map_llm.invoke([HumanMessage(content=map_prompt)])
+            if "관련 정보 없음" not in response.content:
+                extracted_infos.append(response.content)
+        except Exception:
+            continue
+
+    if not extracted_infos:
+        return "문서에서 관련 정보를 찾을 수 없습니다."
+
+    # Reduce 단계: 추출된 정보들을 합쳐서 최종 답변 생성
+    status_container.markdown("✍️ 최종 답변 생성 중...")
+
+    combined_info = "\n\n---\n\n".join(extracted_infos)
+
+    # Reduce용 LLM (스트리밍 포함)
+    reduce_llm = ChatOllama(
+        base_url=ollama_url,
+        model="gemma3:27b",
+        temperature=0,
+        streaming=True,
+        callbacks=[StreamHandler(status_container)],
+        client_kwargs={"headers": headers} if headers else {}
+    )
+
+    expansion_info = f"""[GPT 벡터 추론 결과]
+- 핵심 개념: {', '.join(semantic_expansion.get('core_concepts', []))}
+- 관련 주제: {', '.join(semantic_expansion.get('related_topics', []))}
+- 분석 관점: {', '.join(semantic_expansion.get('sub_questions', [])[:3])}"""
+
+    reduce_prompt = f"""당신은 친절한 과외 선생님입니다.
+아래 문서에서 추출된 정보들을 바탕으로 학생의 질문에 상세히 답변하세요.
+
+[추출된 핵심 정보들]
+{combined_info}
+
+{expansion_info}
+
+[지시사항]
+- 추출된 정보들을 종합하여 완성도 높은 답변을 작성하세요.
+- 구체적인 내용을 인용하며 설명하세요.
+- 한국어로 친절하고 상세하게 답변하세요."""
+
+    response = reduce_llm.invoke([
+        SystemMessage(content=reduce_prompt),
+        HumanMessage(content=question)
+    ])
+
+    return response.content
 
 
 @st.cache_resource(show_spinner="문서 분석 및 임베딩 중...")
@@ -306,54 +412,28 @@ if uploaded_file is not None:
                     prompt_message, openai_key
                 )
 
-                # 2단계: 확장된 벡터 검색 - GPT의 추론 결과를 활용
+                # 2단계: 확장된 벡터 검색 - GPT의 추론 결과를 활용 (더 많은 문서 검색)
                 status_container.markdown("🔍 GPT 추론 기반 향상된 벡터 검색 중...")
 
                 enhanced_docs = enhanced_vector_search(
-                    retriever, prompt_message, semantic_expansion, k=7
-                )
-                enhanced_context = "\n\n".join(doc.page_content for doc in enhanced_docs)
-
-                # 3단계: Ollama가 향상된 컨텍스트로 답변 생성
-                status_container.markdown("✍️ Ollama가 답변을 생성 중...")
-
-                headers = {}
-                if ollama_key:
-                    headers["Authorization"] = f"Bearer {ollama_key}"
-
-                llm = ChatOllama(
-                    base_url=ollama_url,
-                    model="gemma3:27b",
-                    temperature=0,
-                    streaming=True,
-                    callbacks=[StreamHandler(status_container)],
-                    client_kwargs={"headers": headers} if headers else {}
+                    retriever, prompt_message, semantic_expansion, k=10
                 )
 
-                # GPT의 의미적 확장 정보를 Ollama에게 전달
-                expansion_info = f"""[GPT 벡터 추론 결과]
-- 핵심 개념: {', '.join(semantic_expansion.get('core_concepts', []))}
-- 관련 주제: {', '.join(semantic_expansion.get('related_topics', []))}
-- 분석 관점: {', '.join(semantic_expansion.get('sub_questions', [])[:3])}"""
+                # 3단계: Map-Reduce로 분할 처리 (토큰 제한 우회)
+                response_content = map_reduce_with_ollama(
+                    docs=enhanced_docs,
+                    question=prompt_message,
+                    semantic_expansion=semantic_expansion,
+                    ollama_url=ollama_url,
+                    ollama_key=ollama_key,
+                    status_container=status_container,
+                    batch_size=2
+                )
 
-                system_prompt = f"""당신은 친절한 과외 선생님입니다.
-아래 문서 내용과 분석 가이드를 활용하여 학생의 질문에 답변하세요.
-
-[문서 내용 - 향상된 벡터 검색 결과]
-{enhanced_context}
-
-{expansion_info}
-
-[지시사항]
-- GPT 벡터 추론의 핵심 개념과 관련 주제를 참고하여 답변을 구성하세요.
-- 문서에서 관련 내용을 찾아 구체적으로 인용하세요.
-- 분석 관점에서 제시된 하위 질문들도 함께 답변에 반영하세요.
-- 한국어로 친절하고 상세하게 답변하세요."""
-
-                response = llm.invoke([
-                    SystemMessage(content=system_prompt),
-                    HumanMessage(content=prompt_message)
-                ])
+                # 세션에 저장하고 종료
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": response_content})
+                st.stop()
 
             else:  # Ollama (설치형/보안)
                 headers = {}
