@@ -48,9 +48,9 @@ with st.sidebar:
     # Model Selection
     model_provider = st.radio(
         "모델 선택",
-        ["GPT-4o (상용/고품질)", "Ollama (설치형/보안)", "하이브리드 (GPT분석+Ollama답변)"],
+        ["GPT-4o (상용/고품질)", "Ollama (설치형/보안)", "하이브리드 (GPT벡터추론+Ollama답변)"],
         index=2,
-        help="하이브리드: GPT에게 질문만 전송하여 추론 프레임워크를 받고, Ollama가 PDF 내용과 결합하여 답변 생성 (PDF 보안 유지)"
+        help="하이브리드: GPT가 질문만 받아 벡터 추론(의미 확장) 수행 → Ollama가 향상된 벡터 검색으로 고품질 답변 생성 (PDF 내용 보호)"
     )
 
     ollama_url = "https://ollama.com"
@@ -58,7 +58,7 @@ with st.sidebar:
 
     # GPT/하이브리드 모드일 때 OpenAI 키 외부 입력 (항상)
     openai_key = ""
-    if model_provider in ["GPT-4o (상용/고품질)", "하이브리드 (GPT분석+Ollama답변)"]:
+    if model_provider in ["GPT-4o (상용/고품질)", "하이브리드 (GPT벡터추론+Ollama답변)"]:
         openai_key = st.text_input('OpenAI API Key', type="password", help="GPT 모델 사용을 위한 API 키를 입력하세요")
 
     st.divider()
@@ -83,32 +83,109 @@ class StreamHandler(BaseCallbackHandler):
         self.container.markdown(self.text)
 
 
-def get_reasoning_framework_from_gpt(question: str, api_key: str) -> str:
-    """GPT를 사용하여 질문에 대한 추론 프레임워크/가이드를 생성 (PDF 내용 없이 질문만 전송)"""
+def get_semantic_expansion_from_gpt(question: str, api_key: str) -> dict:
+    """
+    GPT를 사용하여 질문의 의미적 확장을 수행 (벡터 추론)
+    PDF 내용 없이 질문만 전송하여 관련 개념, 동의어, 하위 질문을 생성
+    이를 통해 벡터 검색의 품질을 향상시킴
+    """
     llm = ChatOpenAI(
         model="gpt-4o-mini",
-        temperature=0,
+        temperature=0.3,  # 약간의 창의성 허용
         openai_api_key=api_key,
     )
 
-    # PDF 내용 없이 질문만 GPT에게 전송
-    framework_prompt = f"""당신은 질문 분석 전문가입니다.
-아래 질문에 답변하기 위한 체계적인 분석 프레임워크를 제공해주세요.
+    # GPT에게 질문의 의미적 확장 요청 (벡터 공간에서의 관계 추론)
+    expansion_prompt = f"""당신은 의미론적 분석 전문가입니다.
+아래 질문을 분석하여 벡터 검색 품질을 높이기 위한 의미적 확장을 수행하세요.
 
-[질문]
+[원본 질문]
 {question}
 
 [지시사항]
-1. 이 질문에 답변하기 위해 문서에서 찾아야 할 핵심 요소들을 나열하세요.
-2. 답변을 구성할 때 고려해야 할 논리적 단계를 제시하세요.
-3. 좋은 답변의 구조와 포함해야 할 내용을 안내하세요.
-4. 답변 시 주의해야 할 점이나 흔한 실수를 언급하세요.
-5. 한국어로 작성하세요.
+JSON 형식으로 다음을 제공하세요:
+1. "core_concepts": 질문의 핵심 개념 키워드 (3-5개)
+2. "synonyms": 각 핵심 개념의 동의어/유사어 (개념당 2-3개)
+3. "sub_questions": 원본 질문을 답하기 위해 필요한 하위 질문들 (3-5개)
+4. "related_topics": 관련될 수 있는 주제/맥락 (3-5개)
+5. "search_queries": 문서에서 검색할 최적화된 쿼리문 (3-5개)
 
-[분석 프레임워크]"""
+[출력 형식]
+```json
+{{
+  "core_concepts": ["개념1", "개념2", ...],
+  "synonyms": {{"개념1": ["동의어1", "동의어2"], ...}},
+  "sub_questions": ["하위질문1", "하위질문2", ...],
+  "related_topics": ["주제1", "주제2", ...],
+  "search_queries": ["쿼리1", "쿼리2", ...]
+}}
+```"""
 
-    response = llm.invoke([HumanMessage(content=framework_prompt)])
-    return response.content
+    response = llm.invoke([HumanMessage(content=expansion_prompt)])
+
+    # JSON 파싱 시도
+    import json
+    import re
+    try:
+        # JSON 블록 추출
+        json_match = re.search(r'```json\s*(.*?)\s*```', response.content, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group(1))
+        else:
+            # JSON 블록 없이 직접 파싱 시도
+            return json.loads(response.content)
+    except json.JSONDecodeError:
+        # 파싱 실패 시 기본값 반환
+        return {
+            "core_concepts": [question],
+            "synonyms": {},
+            "sub_questions": [question],
+            "related_topics": [],
+            "search_queries": [question]
+        }
+
+
+def enhanced_vector_search(retriever, question: str, semantic_expansion: dict, k: int = 5) -> list:
+    """
+    GPT의 의미적 확장을 활용한 향상된 벡터 검색
+    여러 쿼리로 검색 후 중복 제거 및 결과 병합
+    """
+    all_docs = []
+    seen_contents = set()
+
+    # 1. 원본 질문으로 검색
+    original_docs = retriever.invoke(question)
+    for doc in original_docs:
+        if doc.page_content not in seen_contents:
+            seen_contents.add(doc.page_content)
+            all_docs.append(doc)
+
+    # 2. 확장된 검색 쿼리로 추가 검색
+    search_queries = semantic_expansion.get("search_queries", [])
+    for query in search_queries[:3]:  # 최대 3개 쿼리
+        try:
+            docs = retriever.invoke(query)
+            for doc in docs:
+                if doc.page_content not in seen_contents:
+                    seen_contents.add(doc.page_content)
+                    all_docs.append(doc)
+        except Exception:
+            continue
+
+    # 3. 하위 질문으로 추가 검색
+    sub_questions = semantic_expansion.get("sub_questions", [])
+    for sub_q in sub_questions[:2]:  # 최대 2개 하위 질문
+        try:
+            docs = retriever.invoke(sub_q)
+            for doc in docs:
+                if doc.page_content not in seen_contents:
+                    seen_contents.add(doc.page_content)
+                    all_docs.append(doc)
+        except Exception:
+            continue
+
+    # 결과 개수 제한 (토큰 제한 고려)
+    return all_docs[:k]
 
 
 @st.cache_resource(show_spinner="문서 분석 및 임베딩 중...")
@@ -137,7 +214,7 @@ def embed_file(file, provider, _api_key):
     texts = text_splitter.split_documents(documents)
 
     # Embedding Logic - GPT 또는 하이브리드는 OpenAI 임베딩 사용
-    if provider in ["GPT-4o (상용/고품질)", "하이브리드 (GPT분석+Ollama답변)"]:
+    if provider in ["GPT-4o (상용/고품질)", "하이브리드 (GPT벡터추론+Ollama답변)"]:
         if not _api_key:
             st.error("OpenAI API Key Required")
             st.stop()
@@ -221,16 +298,24 @@ if uploaded_file is not None:
                     HumanMessage(content=prompt_message)
                 ])
 
-            elif model_provider == "하이브리드 (GPT분석+Ollama답변)":
-                # 1단계: GPT로 추론 프레임워크 생성 (PDF 내용 없이 질문만 전송)
-                status_container.markdown("🧠 GPT가 추론 프레임워크를 생성 중... (PDF 내용은 전송되지 않습니다)")
+            elif model_provider == "하이브리드 (GPT벡터추론+Ollama답변)":
+                # 1단계: GPT 벡터 추론 - 질문의 의미적 확장 (PDF 내용 없이 질문만 전송)
+                status_container.markdown("🧠 GPT 벡터 추론 중... (질문만 전송, PDF 내용 보호)")
 
-                reasoning_framework = get_reasoning_framework_from_gpt(
+                semantic_expansion = get_semantic_expansion_from_gpt(
                     prompt_message, openai_key
                 )
 
-                # 2단계: Ollama가 PDF 내용 + GPT 추론 프레임워크를 결합하여 답변 생성
-                status_container.markdown("✍️ Ollama가 문서를 분석하고 답변을 생성 중...")
+                # 2단계: 확장된 벡터 검색 - GPT의 추론 결과를 활용
+                status_container.markdown("🔍 GPT 추론 기반 향상된 벡터 검색 중...")
+
+                enhanced_docs = enhanced_vector_search(
+                    retriever, prompt_message, semantic_expansion, k=7
+                )
+                enhanced_context = "\n\n".join(doc.page_content for doc in enhanced_docs)
+
+                # 3단계: Ollama가 향상된 컨텍스트로 답변 생성
+                status_container.markdown("✍️ Ollama가 답변을 생성 중...")
 
                 headers = {}
                 if ollama_key:
@@ -245,19 +330,24 @@ if uploaded_file is not None:
                     client_kwargs={"headers": headers} if headers else {}
                 )
 
+                # GPT의 의미적 확장 정보를 Ollama에게 전달
+                expansion_info = f"""[GPT 벡터 추론 결과]
+- 핵심 개념: {', '.join(semantic_expansion.get('core_concepts', []))}
+- 관련 주제: {', '.join(semantic_expansion.get('related_topics', []))}
+- 분석 관점: {', '.join(semantic_expansion.get('sub_questions', [])[:3])}"""
+
                 system_prompt = f"""당신은 친절한 과외 선생님입니다.
-아래 제공된 문서 내용과 분석 프레임워크를 활용하여 학생의 질문에 답변하세요.
+아래 문서 내용과 분석 가이드를 활용하여 학생의 질문에 답변하세요.
 
-[문서 내용]
-{context_text}
+[문서 내용 - 향상된 벡터 검색 결과]
+{enhanced_context}
 
-[GPT가 제공한 분석 프레임워크]
-{reasoning_framework}
+{expansion_info}
 
 [지시사항]
-- 위 분석 프레임워크의 가이드를 따라 문서에서 관련 정보를 찾으세요.
-- 프레임워크에서 제시한 논리적 단계에 따라 답변을 구성하세요.
-- 문서의 구체적인 내용을 인용하며 답변하세요.
+- GPT 벡터 추론의 핵심 개념과 관련 주제를 참고하여 답변을 구성하세요.
+- 문서에서 관련 내용을 찾아 구체적으로 인용하세요.
+- 분석 관점에서 제시된 하위 질문들도 함께 답변에 반영하세요.
 - 한국어로 친절하고 상세하게 답변하세요."""
 
                 response = llm.invoke([
