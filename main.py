@@ -338,10 +338,9 @@ def map_reduce_with_ollama(
     # 문서를 배치로 분할
     batches = [docs[i:i + batch_size] for i in range(0, len(docs), batch_size)]
 
-    # Map 단계: 각 배치에서 관련 정보 추출
+    # Map 단계: 각 배치에서 관련 정보 추출 (출력 없음)
     extracted_infos = []
     for idx, batch in enumerate(batches):
-        status_container.markdown(f"📄 문서 분석 중... ({idx + 1}/{len(batches)})")
 
         batch_content = "\n\n".join(doc.page_content for doc in batch)
 
@@ -375,17 +374,14 @@ def map_reduce_with_ollama(
         return "문서에서 관련 정보를 찾을 수 없습니다."
 
     # Reduce 단계: 추출된 정보들을 합쳐서 최종 답변 생성
-    status_container.markdown("✍️ 최종 답변 생성 중...")
-
     combined_info = "\n\n---\n\n".join(extracted_infos)
 
-    # Reduce용 LLM (스트리밍 포함)
+    # Reduce용 LLM (스트리밍 없이 - 중간 출력 숨김)
     reduce_llm = ChatOllama(
         base_url=ollama_url,
         model="gemma3:27b",
         temperature=0,
-        streaming=True,
-        callbacks=[StreamHandler(status_container)],
+        streaming=False,
         client_kwargs={"headers": headers} if headers else {}
     )
 
@@ -551,54 +547,49 @@ if uploaded_file is not None:
                 ])
 
             elif model_provider == "하이브리드 (GPT벡터추론+Ollama답변)":
-                # 진행 상태만 간단히 표시
-                progress_placeholder = status_container.empty()
-                progress_placeholder.markdown("⏳ 답변 생성 중...")
+                # 진행 상태 표시용
+                progress = status_container.empty()
 
-                # 1단계: GPT 추론 답변 (PDF 없이)
+                # 1단계: GPT 추론
+                progress.markdown("🧠 **1/4** GPT 추론 중...")
                 gpt_reasoning_answer = get_gpt_reasoning_answer(
                     prompt_message, openai_key
                 )
-
-                # 2단계: GPT 벡터 추론
                 semantic_expansion = get_semantic_expansion_from_gpt(
                     prompt_message, openai_key
                 )
 
-                # 3단계: 향상된 벡터 검색
+                # 2단계: 벡터 검색
+                progress.markdown("🔍 **2/4** 벡터 검색 중...")
                 enhanced_docs = enhanced_vector_search(
                     retriever, prompt_message, semantic_expansion, k=10
                 )
 
-                # 4단계: Map-Reduce (중간 출력 숨김)
-                hidden_container = st.empty()
+                # 3단계: Map-Reduce (출력 없음)
+                progress.markdown("⚙️ **3/4** 문서 분석 중...")
                 draft_answer = map_reduce_with_ollama(
                     docs=enhanced_docs,
                     question=prompt_message,
                     semantic_expansion=semantic_expansion,
                     ollama_url=ollama_url,
                     ollama_key=ollama_key,
-                    status_container=hidden_container,
+                    status_container=st.empty(),  # 빈 컨테이너 (출력 안 함)
                     gpt_reasoning_answer=gpt_reasoning_answer,
-                    batch_size=2
-                )
-                hidden_container.empty()  # 중간 출력 삭제
-
-                # 5단계: GPT 교정
-                gpt_refined_answer = refine_answer_with_gpt(
-                    draft_answer, prompt_message, openai_key
+                    batch_size=3
                 )
 
-                # 6단계: Ollama 최종 검증 (PDF 기반 진위 판별)
-                progress_placeholder.empty()  # 진행 상태 삭제
+                # 4단계: Ollama 최종 검증 (화면에 출력)
+                progress.markdown("✅ **4/4** 최종 검증 중...")
+                import time
+                time.sleep(0.5)  # 진행 상태 표시를 위한 짧은 대기
+                progress.empty()  # 진행 상태 제거
 
-                # enhanced_docs를 사용하여 더 많은 PDF 컨텍스트로 검증
-                enhanced_context = "\n\n".join(doc.page_content for doc in enhanced_docs)
+                verify_context = "\n\n".join(doc.page_content for doc in enhanced_docs[:5])
 
                 final_answer = verify_with_ollama_pdf(
-                    gpt_answer=gpt_refined_answer,
+                    gpt_answer=draft_answer,
                     question=prompt_message,
-                    pdf_context=enhanced_context,
+                    pdf_context=verify_context,
                     ollama_url=ollama_url,
                     ollama_key=ollama_key,
                     status_container=status_container
