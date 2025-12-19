@@ -83,6 +83,69 @@ class StreamHandler(BaseCallbackHandler):
         self.container.markdown(self.text)
 
 
+def get_gpt_reasoning_answer(question: str, api_key: str) -> str:
+    """
+    GPT가 자신의 학습 데이터만으로 질문에 답변 (PDF 내용 없이)
+    추론 모델을 사용하여 고품질 답변 생성
+    """
+    llm = ChatOpenAI(
+        model="o1-mini",  # 추론 모델 사용
+        openai_api_key=api_key,
+    )
+
+    reasoning_prompt = f"""당신은 지식이 풍부한 전문가입니다.
+아래 질문에 대해 당신이 알고 있는 지식을 바탕으로 상세하게 답변해주세요.
+
+[질문]
+{question}
+
+[지시사항]
+- 질문의 핵심을 파악하고 체계적으로 답변하세요.
+- 관련된 배경 지식, 맥락, 중요한 포인트를 포함하세요.
+- 정확하고 신뢰할 수 있는 정보만 제공하세요.
+- 한국어로 답변하세요.
+
+[답변]"""
+
+    response = llm.invoke([HumanMessage(content=reasoning_prompt)])
+    return response.content
+
+
+def refine_answer_with_gpt(draft_answer: str, question: str, api_key: str) -> str:
+    """
+    Ollama가 생성한 초안 답변을 GPT가 최종 교정
+    더 정확하고 정교하게 다듬음
+    """
+    llm = ChatOpenAI(
+        model="gpt-4o",  # 고품질 교정을 위해 gpt-4o 사용
+        temperature=0,
+        openai_api_key=api_key,
+    )
+
+    refine_prompt = f"""당신은 전문 편집자입니다.
+아래 초안 답변을 검토하고 더 정확하고 정교하게 교정해주세요.
+
+[원본 질문]
+{question}
+
+[초안 답변]
+{draft_answer}
+
+[교정 지시사항]
+1. 사실적 오류가 있으면 수정하세요.
+2. 논리적 흐름을 개선하세요.
+3. 불명확한 표현을 명확하게 다듬으세요.
+4. 중복된 내용은 정리하세요.
+5. 교육적으로 부적절한 표현은 순화하세요.
+6. 핵심 내용은 유지하면서 품질을 높이세요.
+7. 한국어로 자연스럽게 작성하세요.
+
+[교정된 최종 답변]"""
+
+    response = llm.invoke([HumanMessage(content=refine_prompt)])
+    return response.content
+
+
 def get_semantic_expansion_from_gpt(question: str, api_key: str) -> dict:
     """
     GPT를 사용하여 질문의 의미적 확장을 수행 (벡터 추론)
@@ -195,12 +258,13 @@ def map_reduce_with_ollama(
     ollama_url: str,
     ollama_key: str,
     status_container,
+    gpt_reasoning_answer: str = "",
     batch_size: int = 2
 ) -> str:
     """
     Map-Reduce 패턴으로 문서를 분할 처리 후 합침
     1. Map: 각 문서 배치에서 관련 정보 추출
-    2. Reduce: 추출된 정보들을 합쳐서 최종 답변 생성
+    2. Reduce: GPT 추론 답변(높은 가중치) + 추출된 정보들을 합쳐서 최종 답변 생성
     """
     headers = {}
     if ollama_key:
@@ -274,17 +338,32 @@ def map_reduce_with_ollama(
 - 관련 주제: {', '.join(semantic_expansion.get('related_topics', []))}
 - 분석 관점: {', '.join(semantic_expansion.get('sub_questions', [])[:3])}"""
 
-    reduce_prompt = f"""당신은 친절한 과외 선생님입니다.
-아래 문서에서 추출된 정보들을 바탕으로 학생의 질문에 상세히 답변하세요.
+    # GPT 추론 답변 섹션 (가중치 높음)
+    gpt_section = ""
+    if gpt_reasoning_answer:
+        gpt_section = f"""
+[★★★ GPT 전문가 답변 - 가중치 높음 ★★★]
+{gpt_reasoning_answer}
 
-[추출된 핵심 정보들]
+"""
+
+    reduce_prompt = f"""당신은 친절한 과외 선생님입니다.
+아래 정보들을 종합하여 학생의 질문에 최고 품질의 답변을 작성하세요.
+{gpt_section}
+[문서에서 추출된 정보들]
 {combined_info}
 
 {expansion_info}
 
+[가중치 적용 규칙 - 매우 중요]
+1. GPT 전문가 답변에 가장 높은 가중치(70%)를 부여하세요.
+2. 문서 정보는 GPT 답변을 보완하는 용도로 사용하세요(30%).
+3. 문서 정보와 GPT 답변이 충돌할 경우, GPT 답변을 우선하세요.
+4. 단, 문서에만 있는 고유한 정보(이름, 날짜, 구체적 사건)는 반드시 포함하세요.
+
 [지시사항]
-- 추출된 정보들을 종합하여 완성도 높은 답변을 작성하세요.
-- 구체적인 내용을 인용하며 설명하세요.
+- GPT 답변의 논리와 구조를 기반으로 답변을 구성하세요.
+- 문서의 구체적인 내용으로 GPT 답변을 보강하세요.
 - 한국어로 친절하고 상세하게 답변하세요.
 
 [콘텐츠 필터링 - 필수]
@@ -415,34 +494,54 @@ if uploaded_file is not None:
                 ])
 
             elif model_provider == "하이브리드 (GPT벡터추론+Ollama답변)":
-                # 1단계: GPT 벡터 추론 - 질문의 의미적 확장 (PDF 내용 없이 질문만 전송)
-                status_container.markdown("🧠 GPT 벡터 추론 중... (질문만 전송, PDF 내용 보호)")
+                # 1단계: GPT 추론 모델로 직접 답변 받기 (PDF 없이, 학습 데이터 기반)
+                status_container.markdown("🧠 GPT 추론 모델이 답변 생성 중... (PDF 내용 보호)")
+
+                gpt_reasoning_answer = get_gpt_reasoning_answer(
+                    prompt_message, openai_key
+                )
+
+                # 2단계: GPT 벡터 추론 - 질문의 의미적 확장
+                status_container.markdown("🔮 GPT 벡터 추론 중... (의미적 확장)")
 
                 semantic_expansion = get_semantic_expansion_from_gpt(
                     prompt_message, openai_key
                 )
 
-                # 2단계: 확장된 벡터 검색 - GPT의 추론 결과를 활용 (더 많은 문서 검색)
+                # 3단계: 확장된 벡터 검색 - GPT의 추론 결과를 활용
                 status_container.markdown("🔍 GPT 추론 기반 향상된 벡터 검색 중...")
 
                 enhanced_docs = enhanced_vector_search(
                     retriever, prompt_message, semantic_expansion, k=10
                 )
 
-                # 3단계: Map-Reduce로 분할 처리 (토큰 제한 우회)
-                response_content = map_reduce_with_ollama(
+                # 4단계: Map-Reduce로 분할 처리 (GPT 답변 가중치 적용)
+                status_container.markdown("⚖️ GPT 답변(70%) + 문서 정보(30%) 통합 중...")
+
+                draft_answer = map_reduce_with_ollama(
                     docs=enhanced_docs,
                     question=prompt_message,
                     semantic_expansion=semantic_expansion,
                     ollama_url=ollama_url,
                     ollama_key=ollama_key,
                     status_container=status_container,
+                    gpt_reasoning_answer=gpt_reasoning_answer,
                     batch_size=2
                 )
 
+                # 5단계: GPT 최종 교정 - 정확성과 품질 향상
+                status_container.markdown("✨ GPT가 최종 답변 교정 중...")
+
+                final_answer = refine_answer_with_gpt(
+                    draft_answer, prompt_message, openai_key
+                )
+
+                # 최종 답변 표시
+                status_container.markdown(final_answer)
+
                 # 세션에 저장하고 종료
                 st.session_state.messages.append(
-                    {"role": "assistant", "content": response_content})
+                    {"role": "assistant", "content": final_answer})
                 st.stop()
 
             else:  # Ollama (설치형/보안)
