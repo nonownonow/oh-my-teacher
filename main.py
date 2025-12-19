@@ -192,31 +192,21 @@ def verify_with_ollama_pdf(
         client_kwargs={"headers": headers} if headers else {}
     )
 
-    # Ollama 토큰 한도 대응: 문맥 크기 제한
-    limited_pdf_context = pdf_context[:30000] if len(pdf_context) > 30000 else pdf_context
-    limited_gpt_answer = gpt_answer[:10000] if len(gpt_answer) > 10000 else gpt_answer
+    # Ollama Cloud 토큰 한도 대응: 작은 문맥
+    limited_pdf_context = pdf_context[:3000] if len(pdf_context) > 3000 else pdf_context
+    limited_gpt_answer = gpt_answer[:2000] if len(gpt_answer) > 2000 else gpt_answer
 
-    verify_prompt = f"""당신은 엄격한 팩트체커입니다.
-GPT가 작성한 답변을 PDF 원본 문서와 대조하여 철저히 검증하세요.
+    verify_prompt = f"""팩트체커입니다. PDF 기반으로 검증하세요.
 
-[PDF 원본 문서 - 유일한 진실의 기준]
+[PDF]
 {limited_pdf_context}
 
-[GPT가 작성한 답변 - 검증 대상]
+[검증 대상]
 {limited_gpt_answer}
 
-[검증 규칙 - 반드시 준수]
-1. PDF 문서가 유일한 진실입니다. PDF에 없으면 거짓입니다.
-2. 등장인물: PDF에 명시된 이름만 사용하세요. PDF에 없는 인물은 삭제하세요.
-3. 관계: PDF에 명시된 관계만 사용하세요. 추측하지 마세요.
-4. 사건: PDF에 있는 사건만 포함하세요.
-5. GPT가 언급했지만 PDF에 없는 모든 정보는 과감히 삭제하세요.
-6. 확신이 없으면 포함하지 마세요.
-
-[콘텐츠 필터링]
-- 교육적으로 부적절한 표현은 순화하세요.
-
-[최종 답변]"""
+[규칙]
+- PDF에 없으면 삭제
+- 한국어로 답변"""
 
     response = llm.invoke([
         SystemMessage(content=verify_prompt),
@@ -367,6 +357,8 @@ def map_reduce_with_ollama(
     for idx, batch in enumerate(batches):
 
         batch_content = "\n\n".join(doc.page_content for doc in batch)
+        # Ollama Cloud 토큰 한도 대응
+        batch_content = batch_content[:2000] if len(batch_content) > 2000 else batch_content
 
         map_prompt = f"""다음 문서에서 질문에 답변하기 위해 필요한 핵심 정보만 추출하세요.
 
@@ -399,6 +391,9 @@ def map_reduce_with_ollama(
 
     # Reduce 단계: 추출된 정보들을 합쳐서 최종 답변 생성
     combined_info = "\n\n---\n\n".join(extracted_infos)
+    # Ollama Cloud 토큰 한도 대응
+    combined_info = combined_info[:3000] if len(combined_info) > 3000 else combined_info
+    limited_gpt_answer = gpt_reasoning_answer[:1500] if len(gpt_reasoning_answer) > 1500 else gpt_reasoning_answer
 
     # Reduce용 LLM (스트리밍 없이 - 중간 출력 숨김)
     reduce_llm = ChatOllama(
@@ -409,44 +404,19 @@ def map_reduce_with_ollama(
         client_kwargs={"headers": headers} if headers else {}
     )
 
-    expansion_info = f"""[GPT 벡터 추론 결과]
-- 핵심 개념: {', '.join(semantic_expansion.get('core_concepts', []))}
-- 관련 주제: {', '.join(semantic_expansion.get('related_topics', []))}
-- 분석 관점: {', '.join(semantic_expansion.get('sub_questions', [])[:3])}"""
-
-    # GPT 추론 답변 섹션 (참고용, 낮은 가중치)
+    # GPT 추론 답변 섹션 (참고용)
     gpt_section = ""
-    if gpt_reasoning_answer:
-        gpt_section = f"""
-[GPT 참고 답변 - 구조/표현만 참고]
-{gpt_reasoning_answer}
+    if limited_gpt_answer:
+        gpt_section = f"\n[GPT 참고]\n{limited_gpt_answer}\n"
 
-"""
+    reduce_prompt = f"""과외 선생님입니다. 정보를 종합하여 답변하세요.
 
-    reduce_prompt = f"""당신은 친절한 과외 선생님입니다.
-아래 정보들을 종합하여 학생의 질문에 답변을 작성하세요.
-
-[★★★ PDF 문서 정보 - 가중치 최우선 ★★★]
+[PDF 문서 정보]
 {combined_info}
-
-{expansion_info}
 {gpt_section}
-[가중치 적용 규칙 - 매우 중요]
-1. PDF 문서 정보에 가장 높은 가중치(70%)를 부여하세요.
-2. GPT 답변은 구조와 표현 참고용으로만 사용하세요(30%).
-3. PDF 문서와 GPT 답변이 충돌할 경우, PDF 문서를 우선하세요.
-4. 등장인물 이름, 관계, 사건은 반드시 PDF 문서 그대로 사용하세요.
-5. GPT가 언급했지만 PDF에 없는 정보는 포함하지 마세요.
-
-[지시사항]
-- PDF 문서의 내용을 기반으로 답변을 구성하세요.
-- GPT 답변의 좋은 구조와 표현만 참고하세요.
-- 한국어로 친절하고 상세하게 답변하세요.
-
-[콘텐츠 필터링 - 필수]
-- 교육적으로 부적절한 표현(난봉, 바람둥이, 색골 등)은 순화된 표현으로 대체하세요.
-- 선정적이거나 폭력적인 묘사는 피하고 교육적으로 적합한 표현을 사용하세요.
-- 학생에게 적합한 품위 있는 언어를 사용하세요."""
+[규칙]
+- PDF 우선(70%), GPT는 참고용(30%)
+- 한국어로 답변하세요."""
 
     response = reduce_llm.invoke([
         SystemMessage(content=reduce_prompt),
